@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""Save / restore iTerm2 windows, tabs, split panes, folders and Claude Code sessions.
+
+  iterm-layout save            snapshot now (skipped if nothing changed)
+  iterm-layout auto            snapshot at most once a minute, only inside iTerm (for hooks)
+  iterm-layout list            show recent snapshots
+  iterm-layout restore [N]     recreate snapshot N from `list` (asks if N is omitted)
+  iterm-layout show [N]        print what restore would open
+  iterm-layout --version       print the version
+
+Each pane is restored as `cd <dir>` or `cd <dir> && claude <flags> --resume <session id>`.
+Claude sessions that are already running somewhere are not started twice; without the
+`claude` command on PATH, such panes reopen as a plain `cd <dir>`.
+Snapshots: ~/.config/iterm-layout/snapshots (last 200 kept).
+"""
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+__version__ = "0.1.0"
+
+DIR = os.path.expanduser("~/.config/iterm-layout/snapshots")
+STAMP = os.path.expanduser("~/.config/iterm-layout/.last-auto")
+CLAUDE_SESSIONS = os.path.expanduser("~/.claude/sessions")
+KEEP = 200
+TOL = 3  # cells of slack when inferring split layout from pane sizes
+CELL_ASPECT = 0.48  # terminal cell width / height
+
+ENUM_SCRIPT = r'''
+set TB to character id 9
+tell application "iTerm2"
+  set out to ""
+  repeat with w in windows
+    set b to bounds of w
+    set out to out & "W" & TB & (item 1 of b) & "," & (item 2 of b) & "," & (item 3 of b) & "," & (item 4 of b) & linefeed
+    repeat with t in tabs of w
+      set out to out & "T" & linefeed
+      repeat with s in sessions of t
+        set out to out & "S" & TB & (tty of s) & TB & (columns of s) & TB & (rows of s) & TB & (name of s) & linefeed
+      end repeat
+    end repeat
+  end repeat
+  return out
+end tell
+'''
+
+
+def sh(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return ""
+
+
+# ---------- snapshot ----------
+
+def live_claude():
+    """pid -> {sessionId, cwd} for running claude processes."""
+    res = {}
+    for f in glob.glob(os.path.join(CLAUDE_SESSIONS, "*.json")):
+        try:
+            d = json.load(open(f))
+            pid = int(d["pid"])
+            os.kill(pid, 0)
+            res[pid] = d
+        except Exception:
+            continue
+    return res
+
+
+def pane_info(tty, claude):
+    short = tty.replace("/dev/", "")
+    procs = []
+    for line in sh(["ps", "-t", short, "-o", "pid=,command="]).splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            procs.append((int(parts[0]), parts[1]))
+    for pid, cmd in procs:
+        if pid in claude:
+            d = claude[pid]
+            argv = shlex.split(cmd)[1:] if cmd else []
+            flags, skip = [], False
+            for a in argv:
+                if skip:
+                    skip = False
+                    continue
+                if a in ("--resume", "-r", "--session-id"):
+                    skip = True
+                    continue
+                if a in ("--continue", "-c") or a.startswith("--resume="):
+                    continue
+                if a.startswith("-"):
+                    flags.append(a)
+            return {"cwd": d.get("cwd"), "claude": {"session": d.get("sessionId"), "flags": flags}}
+    # plain shell: cwd of the login shell on this tty
+    for pid, cmd in procs:
+        name = os.path.basename(cmd.split()[0]).lstrip("-")
+        if name in ("zsh", "bash", "fish", "sh"):
+            out = sh(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"])
+            for l in out.splitlines():
+                if l.startswith("n"):
+                    return {"cwd": l[1:], "claude": None}
+    return {"cwd": None, "claude": None}
+
+
+def infer_layout(panes, bounds=None):
+    """Rebuild the split tree from pane sizes (iTerm lists panes in tree order).
+
+    Sizes alone can be ambiguous (3 stacked panes vs 1 tall + 2 stacked), so the root is
+    chosen by how well the total grid matches the window's pixel aspect ratio.
+    """
+    import math
+    memo = {}
+
+    def dims(node):
+        return node["_dims"]
+
+    def parse(i, j, forbid):
+        key = (i, j, forbid)
+        if key in memo:
+            return memo[key]
+        if j - i == 1:
+            p = panes[i]
+            r = (0, dict(p, type="pane", _dims=(p["cols"], p["rows"])))
+            memo[key] = r
+            return r
+        best = None
+        for orient in ("V", "H"):
+            if orient == forbid:
+                continue
+            for cuts in compositions(i, j):
+                kids, err = [], 0
+                ok = True
+                for a, b in cuts:
+                    sub = parse(a, b, orient)
+                    if sub is None:
+                        ok = False
+                        break
+                    err += sub[0]
+                    kids.append(sub[1])
+                if not ok:
+                    continue
+                if orient == "V":  # side by side: same height
+                    hs = [dims(k)[1] for k in kids]
+                    mism = max(hs) - min(hs)
+                    d = (sum(dims(k)[0] for k in kids) + len(kids) - 1, max(hs))
+                else:  # stacked: same width
+                    ws = [dims(k)[0] for k in kids]
+                    mism = max(ws) - min(ws)
+                    d = (max(ws), sum(dims(k)[1] for k in kids) + len(kids) - 1)
+                if mism > TOL:
+                    continue
+                cand = (err + mism, {"type": orient, "children": kids, "_dims": d})
+                if best is None or cand[0] < best[0]:
+                    best = cand
+        memo[key] = best
+        return best
+
+    if len(panes) > 1:
+        x1, y1, x2, y2 = bounds or (0, 0, 1600, 1000)
+        expected = max(x2 - x1, 1) / max(y2 - y1 - 30, 1) / CELL_ASPECT
+        cands = []
+        for root in ("V", "H"):
+            c = parse(0, len(panes), "H" if root == "V" else "V")
+            if c:
+                w, h = c[1]["_dims"]
+                cands.append((c[0] + 20 * abs(math.log((w / max(h, 1)) / expected)), c))
+        res = min(cands, key=lambda x: x[0])[1] if cands else None
+    else:
+        res = parse(0, 1, None)
+    if res is None:  # fall back: side by side
+        res = (0, {"type": "V", "children": [dict(p, type="pane") for p in panes]})
+    return strip(res[1])
+
+
+def compositions(i, j):
+    n = j - i
+    for mask in range(1, 2 ** (n - 1)):
+        cuts, start = [], i
+        for k in range(n - 1):
+            if mask & (1 << k):
+                cuts.append((start, i + k + 1))
+                start = i + k + 1
+        cuts.append((start, j))
+        yield cuts
+
+
+def strip(node):
+    node.pop("_dims", None)
+    for k in ("cols", "rows", "tty"):
+        node.pop(k, None)
+    for c in node.get("children", []):
+        strip(c)
+    return node
+
+
+def take_snapshot():
+    out = sh(["osascript", "-e", ENUM_SCRIPT])
+    if not out.strip():
+        return None
+    claude = live_claude()
+    windows = []
+    for line in out.splitlines():
+        f = line.split("\t")
+        if f[0] == "W":
+            windows.append({"bounds": [int(float(x)) for x in f[1].split(",")], "tabs": []})
+        elif f[0] == "T":
+            windows[-1]["tabs"].append([])
+        elif f[0] == "S" and len(f) >= 4:
+            p = {"tty": f[1], "cols": int(f[2]), "rows": int(f[3]), "title": f[4] if len(f) > 4 else ""}
+            p.update(pane_info(f[1], claude))
+            windows[-1]["tabs"][-1].append(p)
+    for w in windows:
+        w["tabs"] = [infer_layout(t, w["bounds"]) for t in w["tabs"] if t]
+    return {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "windows": windows}
+
+
+def fingerprint(snap):
+    s = json.loads(json.dumps(snap))
+    s.pop("ts", None)
+
+    def clean(n):
+        n.pop("title", None)
+        for c in n.get("children", []):
+            clean(c)
+    for w in s["windows"]:
+        w.pop("bounds", None)
+        for t in w["tabs"]:
+            clean(t)
+    return json.dumps(s, sort_keys=True)
+
+
+def snapshots():
+    return sorted(glob.glob(os.path.join(DIR, "*.json")), reverse=True)
+
+
+def save(quiet=False):
+    snap = take_snapshot()
+    if not snap or not snap["windows"]:
+        if not quiet:
+            print("iTerm2 is not running or has no windows; nothing saved.")
+        return
+    os.makedirs(DIR, exist_ok=True)
+    existing = snapshots()
+    if existing:
+        try:
+            if fingerprint(json.load(open(existing[0]))) == fingerprint(snap):
+                if not quiet:
+                    print("No changes since the last snapshot:", os.path.basename(existing[0]))
+                return
+        except Exception:
+            pass
+    path = os.path.join(DIR, time.strftime("%Y%m%d-%H%M%S") + ".json")
+    json.dump(snap, open(path, "w"), ensure_ascii=False, indent=1)
+    for old in snapshots()[KEEP:]:
+        os.remove(old)
+    if not quiet:
+        print("Saved", path)
+        print(summary(snap))
+
+
+def auto():
+    if os.environ.get("TERM_PROGRAM") != "iTerm.app":
+        return
+    try:
+        if time.time() - os.path.getmtime(STAMP) < 60:
+            return
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(STAMP), exist_ok=True)
+    open(STAMP, "w").close()
+    save(quiet=True)
+
+
+# ---------- list / restore ----------
+
+def leaves(node):
+    if node["type"] == "pane":
+        return [node]
+    return [l for c in node["children"] for l in leaves(c)]
+
+
+def shape(node):
+    if node["type"] == "pane":
+        return "1"
+    return node["type"] + "(" + ",".join(shape(c) for c in node["children"]) + ")"
+
+
+def summary(snap):
+    lines = []
+    for wi, w in enumerate(snap["windows"], 1):
+        for t in w["tabs"]:
+            names = []
+            for p in leaves(t):
+                d = os.path.basename(p.get("cwd") or "?")
+                names.append(d + ("*" if p.get("claude") else ""))
+            lines.append(f"   window {wi}: {len(leaves(t))} pane(s) {shape(t)}  " + ", ".join(names))
+    return "\n".join(lines)
+
+
+def counts(snap):
+    ps = [p for w in snap["windows"] for t in w["tabs"] for p in leaves(t)]
+    return len(snap["windows"]), len(ps), sum(1 for p in ps if p.get("claude"))
+
+
+def list_snaps(n=10):
+    files = snapshots()[:n]
+    if not files:
+        print("No snapshots yet. Run: iterm-layout save")
+        return []
+    for i, f in enumerate(files, 1):
+        s = json.load(open(f))
+        w, p, c = counts(s)
+        print(f"{i:>2}) {s['ts']}  {w} windows, {p} panes, {c} claude sessions")
+        print(summary(s))
+    return files
+
+
+def pane_command(p, running, has_claude=True):
+    cwd = p.get("cwd")
+    parts = []
+    if cwd and os.path.isdir(cwd):
+        parts.append("cd " + shlex.quote(cwd))
+    c = p.get("claude")
+    if c and c.get("session") and has_claude:
+        if c["session"] in running:
+            parts.append(f"echo 'Claude session {c['session']} is already open in another pane'")
+        else:
+            parts.append(" ".join(["claude"] + [shlex.quote(f) for f in c.get("flags", [])] +
+                                  ["--resume", c["session"]]))
+    return " && ".join(parts)
+
+
+def as_str(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def build_script(snap, running, has_claude=True):
+    lines, writes, counter = ['tell application "iTerm2"'], [], [0]
+
+    def new_var():
+        counter[0] += 1
+        return f"s{counter[0]}"
+
+    def build(var, node):
+        if node["type"] == "pane":
+            cmd = pane_command(node, running, has_claude)
+            if cmd:
+                writes.append(f"  tell {var} to write text {as_str(cmd)}")
+            return
+        verb = "split vertically" if node["type"] == "V" else "split horizontally"
+        vars_ = [var]
+        for _ in node["children"][1:]:
+            v = new_var()
+            lines.append(f"  tell {vars_[-1]} to set {v} to ({verb} with default profile)")
+            vars_.append(v)
+        for v, child in zip(vars_, node["children"]):
+            build(v, child)
+
+    for wi, w in enumerate(snap["windows"], 1):
+        if not w["tabs"]:
+            continue
+        lines.append(f"  set w{wi} to (create window with default profile)")
+        lines.append(f"  set bounds of w{wi} to {{{','.join(str(x) for x in w['bounds'])}}}")
+        for ti, t in enumerate(w["tabs"]):
+            v = new_var()
+            if ti == 0:
+                lines.append(f"  set {v} to current session of w{wi}")
+            else:
+                lines.append(f"  tell w{wi} to set t_{v} to (create tab with default profile)")
+                lines.append(f"  set {v} to current session of t_{v}")
+            build(v, t)
+    lines.append("  delay 1")
+    lines += writes
+    lines.append("end tell")
+    return "\n".join(lines)
+
+
+def pick(arg):
+    files = snapshots()
+    if not files:
+        sys.exit("No snapshots yet. Run: iterm-layout save")
+    if arg is None:
+        list_snaps()
+        if not sys.stdin.isatty():
+            sys.exit("\nPick a snapshot number and run: iterm-layout restore N")
+        ans = input("\nRestore which snapshot? [1] ").strip() or "1"
+    else:
+        ans = arg
+    try:
+        idx = int(ans) - 1
+    except ValueError:
+        sys.exit(f"Not a snapshot number: {ans}")
+    if not 0 <= idx < len(files):
+        sys.exit("No such snapshot.")
+    return json.load(open(files[idx]))
+
+
+def restore(arg, dry=False):
+    snap = pick(arg)
+    running = {d.get("sessionId") for d in live_claude().values()}
+    has_claude = shutil.which("claude") is not None
+    script = build_script(snap, running, has_claude)
+    if dry:
+        for w in snap["windows"]:
+            for t in w["tabs"]:
+                print(f"window {w['bounds']} layout {shape(t)}")
+                for p in leaves(t):
+                    print("   ", pane_command(p, running, has_claude) or "(empty shell)")
+        return
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("osascript failed: " + r.stderr)
+    w, p, c = counts(snap)
+    print(f"Restored snapshot {snap['ts']}: {w} windows, {p} panes, {c} claude sessions "
+          f"({len([1 for x in [q for ww in snap['windows'] for t in ww['tabs'] for q in leaves(t)] if x.get('claude') and x['claude']['session'] in running])} already running, skipped).")
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else "help"
+    arg = args[1] if len(args) > 1 else None
+    if cmd in ("--version", "-V", "version"):
+        print("iterm-layout", __version__)
+        return
+    if cmd in ("save", "restore") and sys.platform != "darwin":
+        sys.exit("iterm-layout needs macOS with iTerm2.")
+    if cmd == "save":
+        save()
+    elif cmd == "auto":
+        try:
+            auto()
+        except Exception:
+            pass
+    elif cmd == "list":
+        if arg and not arg.isdigit():
+            sys.exit(f"Not a number: {arg}")
+        list_snaps(int(arg) if arg else 10)
+    elif cmd == "restore":
+        restore(arg)
+    elif cmd == "show":
+        restore(arg or "1", dry=True)
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

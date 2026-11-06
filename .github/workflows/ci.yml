@@ -1,0 +1,18 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile
+        run: python3 -m py_compile iterm-layout
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: CLI smoke
+        run: |
+          ./iterm-layout --version
+          ./iterm-layout help | grep -q "iterm-layout save"
