@@ -6,12 +6,17 @@
   iterm-layout list            show recent snapshots
   iterm-layout restore [N]     recreate snapshot N from `list` (asks if N is omitted)
   iterm-layout show [N]        print what restore would open
+  iterm-layout name N NAME     name snapshot N (`name N ""` removes the name); alias: rename
+  iterm-layout delete N        delete snapshot N (asks first; --yes skips the question)
   iterm-layout --version       print the version
+
+N is a number from `list` or a snapshot name; when several snapshots share a name, the
+newest one is used. Named snapshots are never removed by the automatic cleanup.
 
 Each pane is restored as `cd <dir>` or `cd <dir> && claude <flags> --resume <session id>`.
 Claude sessions that are already running somewhere are not started twice; without the
 `claude` command on PATH, such panes reopen as a plain `cd <dir>`.
-Snapshots: ~/.config/iterm-layout/snapshots (last 200 kept).
+Snapshots: ~/.config/iterm-layout/snapshots (last 200 unnamed ones kept).
 """
 import glob
 import json
@@ -23,7 +28,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 DIR = os.path.expanduser("~/.config/iterm-layout/snapshots")
 STAMP = os.path.expanduser("~/.config/iterm-layout/.last-auto")
@@ -224,6 +229,7 @@ def take_snapshot():
 def fingerprint(snap):
     s = json.loads(json.dumps(snap))
     s.pop("ts", None)
+    s.pop("name", None)
 
     def clean(n):
         n.pop("title", None)
@@ -238,6 +244,46 @@ def fingerprint(snap):
 
 def snapshots():
     return sorted(glob.glob(os.path.join(DIR, "*.json")), reverse=True)
+
+
+def load(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def write(path, snap):
+    with open(path, "w") as f:
+        json.dump(snap, f, ensure_ascii=False, indent=1)
+
+
+def name_of(path):
+    try:
+        return load(path).get("name") or ""
+    except Exception:
+        return ""
+
+
+def resolve(arg):
+    """Snapshot file for a number from `list` or a name (the newest one with that name)."""
+    files = snapshots()
+    if not files:
+        sys.exit("No snapshots yet. Run: iterm-layout save")
+    arg = str(arg).strip()
+    if arg.isdigit():
+        idx = int(arg) - 1
+        if not 0 <= idx < len(files):
+            sys.exit(f"No snapshot number {arg}. See: iterm-layout list")
+        return files[idx]
+    for f in files:
+        if name_of(f) == arg:
+            return f
+    sys.exit(f"No snapshot named {arg!r}. See: iterm-layout list")
+
+
+def prune():
+    unnamed = [f for f in snapshots() if not name_of(f)]
+    for old in unnamed[KEEP:]:
+        os.remove(old)
 
 
 def save(quiet=False):
@@ -257,9 +303,8 @@ def save(quiet=False):
         except Exception:
             pass
     path = os.path.join(DIR, time.strftime("%Y%m%d-%H%M%S") + ".json")
-    json.dump(snap, open(path, "w"), ensure_ascii=False, indent=1)
-    for old in snapshots()[KEEP:]:
-        os.remove(old)
+    write(path, snap)
+    prune()
     if not quiet:
         print("Saved", path)
         print(summary(snap))
@@ -315,9 +360,10 @@ def list_snaps(n=10):
         print("No snapshots yet. Run: iterm-layout save")
         return []
     for i, f in enumerate(files, 1):
-        s = json.load(open(f))
+        s = load(f)
         w, p, c = counts(s)
-        print(f"{i:>2}) {s['ts']}  {w} windows, {p} panes, {c} claude sessions")
+        label = f"  [{s['name']}]" if s.get("name") else ""
+        print(f"{i:>2}) {s['ts']}{label}  {w} windows, {p} panes, {c} claude sessions")
         print(summary(s))
     return files
 
@@ -383,23 +429,47 @@ def build_script(snap, running, has_claude=True):
 
 
 def pick(arg):
-    files = snapshots()
-    if not files:
+    if not snapshots():
         sys.exit("No snapshots yet. Run: iterm-layout save")
     if arg is None:
         list_snaps()
         if not sys.stdin.isatty():
             sys.exit("\nPick a snapshot number and run: iterm-layout restore N")
-        ans = input("\nRestore which snapshot? [1] ").strip() or "1"
+        arg = input("\nRestore which snapshot? [1] ").strip() or "1"
+    return load(resolve(arg))
+
+
+def set_name(arg, name):
+    if arg is None or name is None:
+        sys.exit('Usage: iterm-layout name N NAME   (name N "" removes the name)')
+    name = name.strip()
+    if name.isdigit():
+        sys.exit("A name cannot be a number: it would be confused with a snapshot number.")
+    path = resolve(arg)
+    snap = load(path)
+    if name:
+        snap["name"] = name
     else:
-        ans = arg
-    try:
-        idx = int(ans) - 1
-    except ValueError:
-        sys.exit(f"Not a snapshot number: {ans}")
-    if not 0 <= idx < len(files):
-        sys.exit("No such snapshot.")
-    return json.load(open(files[idx]))
+        snap.pop("name", None)
+    write(path, snap)
+    print(f"Snapshot {snap['ts']}: " + (f"named {name!r}" if name else "name removed"))
+
+
+def delete(arg, yes=False, ask=input):
+    if arg is None:
+        sys.exit("Usage: iterm-layout delete N [--yes]")
+    path = resolve(arg)
+    snap = load(path)
+    label = snap["ts"] + (f" [{snap['name']}]" if snap.get("name") else "")
+    if not yes:
+        if not sys.stdin.isatty() and ask is input:
+            sys.exit(f"Not deleting {label} without a question; add --yes.")
+        if ask(f"Delete snapshot {label}? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Not deleted.")
+            return False
+    os.remove(path)
+    print(f"Deleted snapshot {label}")
+    return True
 
 
 def restore(arg, dry=False):
@@ -424,6 +494,8 @@ def restore(arg, dry=False):
 
 def main():
     args = sys.argv[1:]
+    yes = "--yes" in args or "-y" in args
+    args = [a for a in args if a not in ("--yes", "-y")]
     cmd = args[0] if args else "help"
     arg = args[1] if len(args) > 1 else None
     if cmd in ("--version", "-V", "version"):
@@ -446,6 +518,10 @@ def main():
         restore(arg)
     elif cmd == "show":
         restore(arg or "1", dry=True)
+    elif cmd in ("name", "rename"):
+        set_name(arg, args[2] if len(args) > 2 else None)
+    elif cmd == "delete":
+        delete(arg, yes)
     else:
         print(__doc__)
 
