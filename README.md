@@ -29,10 +29,14 @@ Requirements: macOS, iTerm2, `python3` (ships with the Xcode Command Line Tools)
 | `iterm-layout list [N]` | Show the last N snapshots (10 by default) |
 | `iterm-layout show [N]` | Print what `restore N` would open, without opening anything |
 | `iterm-layout restore [N]` | Recreate snapshot N from `list`; asks which one when N is omitted |
+| `iterm-layout name N NAME` | Give snapshot N a name (`name N ""` removes it); alias `rename` |
+| `iterm-layout delete N` | Delete snapshot N; asks first, `--yes` skips the question |
 | `iterm-layout auto` | Snapshot at most once a minute and only inside iTerm2, for hooks |
 | `iterm-layout --version` | Print the version |
 
-Snapshots are JSON files in `~/.config/iterm-layout/snapshots`; the last 200 are kept.
+N is a number from `list` or a snapshot name, so `iterm-layout restore work` works once a snapshot is named `work` (with several of the same name, the newest wins).
+
+Snapshots are JSON files in `~/.config/iterm-layout/snapshots`. The last 200 unnamed snapshots are kept; named ones are never cleaned up, so name the layouts you want to keep.
 
 ## How it works
 
