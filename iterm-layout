@@ -26,6 +26,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 __version__ = "0.2.0"
@@ -252,8 +253,20 @@ def load(path):
 
 
 def write(path, snap):
-    with open(path, "w") as f:
-        json.dump(snap, f, ensure_ascii=False, indent=1)
+    """Write atomically: a failed dump leaves the old file intact."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(snap, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def is_number(s):
+    return s.isascii() and s.isdigit()
 
 
 def name_of(path):
@@ -263,13 +276,17 @@ def name_of(path):
         return ""
 
 
-def resolve(arg):
-    """Snapshot file for a number from `list` or a name (the newest one with that name)."""
-    files = snapshots()
+def resolve(arg, files=None):
+    """Snapshot file for a number from `list` or a name (the newest one with that name).
+
+    `files` pins the list the number refers to (the one just shown to the user)."""
+    files = snapshots() if files is None else files
     if not files:
         sys.exit("No snapshots yet. Run: iterm-layout save")
     arg = str(arg).strip()
-    if arg.isdigit():
+    if not arg:
+        sys.exit("Which snapshot? Give a number from `iterm-layout list` or a name.")
+    if is_number(arg):
         idx = int(arg) - 1
         if not 0 <= idx < len(files):
             sys.exit(f"No snapshot number {arg}. See: iterm-layout list")
@@ -432,10 +449,11 @@ def pick(arg):
     if not snapshots():
         sys.exit("No snapshots yet. Run: iterm-layout save")
     if arg is None:
-        list_snaps()
+        shown = list_snaps()
         if not sys.stdin.isatty():
             sys.exit("\nPick a snapshot number and run: iterm-layout restore N")
         arg = input("\nRestore which snapshot? [1] ").strip() or "1"
+        return load(resolve(arg, shown))   # numbers as shown, even if a snapshot was saved meanwhile
     return load(resolve(arg))
 
 
@@ -443,7 +461,7 @@ def set_name(arg, name):
     if arg is None or name is None:
         sys.exit('Usage: iterm-layout name N NAME   (name N "" removes the name)')
     name = name.strip()
-    if name.isdigit():
+    if is_number(name):
         sys.exit("A name cannot be a number: it would be confused with a snapshot number.")
     path = resolve(arg)
     snap = load(path)
@@ -494,8 +512,10 @@ def restore(arg, dry=False):
 
 def main():
     args = sys.argv[1:]
-    yes = "--yes" in args or "-y" in args
-    args = [a for a in args if a not in ("--yes", "-y")]
+    yes = False
+    if args and args[0] == "delete":   # --yes belongs to delete only
+        yes = "--yes" in args[1:] or "-y" in args[1:]
+        args = [args[0]] + [a for a in args[1:] if a not in ("--yes", "-y")]
     cmd = args[0] if args else "help"
     arg = args[1] if len(args) > 1 else None
     if cmd in ("--version", "-V", "version"):
@@ -511,7 +531,7 @@ def main():
         except Exception:
             pass
     elif cmd == "list":
-        if arg and not arg.isdigit():
+        if arg and not is_number(arg):
             sys.exit(f"Not a number: {arg}")
         list_snaps(int(arg) if arg else 10)
     elif cmd == "restore":

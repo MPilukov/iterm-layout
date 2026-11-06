@@ -103,6 +103,8 @@ class NamesAndDeleteTests(unittest.TestCase):
             il.write(os.path.join(il.DIR, f"2026010{i}-000000.json"), snap(f"2026-01-0{i} 00:00:00", cwd=f"/w{i}"))
 
     def tearDown(self):
+        import shutil
+        shutil.rmtree(il.DIR, ignore_errors=True)
         il.DIR = self.old_dir
 
     def ts(self, arg):
@@ -135,7 +137,7 @@ class NamesAndDeleteTests(unittest.TestCase):
         self.assertEqual(self.ts("dup"), "2026-01-03 00:00:00")
 
     def test_unknown_name_or_number_exits_cleanly(self):
-        for arg in ("nope", "9", "0"):
+        for arg in ("nope", "9", "0", "²"):
             with self.assertRaises(SystemExit):
                 il.resolve(arg)
 
@@ -158,6 +160,35 @@ class NamesAndDeleteTests(unittest.TestCase):
             il.KEEP = old_keep
         names = [(il.load(f)["ts"], il.load(f).get("name")) for f in il.snapshots()]
         self.assertEqual(names, [("2026-01-03 00:00:00", None), ("2026-01-01 00:00:00", "keep me")])
+
+    def test_empty_selector_is_refused(self):
+        for arg in ("", "  "):
+            with self.assertRaises(SystemExit):
+                il.resolve(arg)
+        self.assertEqual(len(il.snapshots()), 3)
+
+    def test_number_refers_to_the_list_that_was_shown(self):
+        shown = il.snapshots()
+        il.write(os.path.join(il.DIR, "20260109-000000.json"), snap("2026-01-09 00:00:00"))   # saved meanwhile
+        self.assertEqual(il.load(il.resolve("1", shown))["ts"], "2026-01-03 00:00:00")
+
+    def test_failed_write_keeps_the_old_file(self):
+        path = il.snapshots()[0]
+        before = open(path).read()
+        with self.assertRaises(TypeError):
+            il.write(path, {"ts": "x", "bad": object()})   # not JSON-serialisable mid-dump
+        self.assertEqual(open(path).read(), before)
+        self.assertEqual([f for f in os.listdir(il.DIR) if f.endswith(".tmp")], [])
+
+    def test_yes_flag_is_only_parsed_for_delete(self):
+        import sys
+        argv = sys.argv
+        try:
+            sys.argv = ["iterm-layout", "name", "2", "--yes"]
+            il.main()   # "--yes" is the name here, not a flag
+        finally:
+            sys.argv = argv
+        self.assertEqual(il.load(il.resolve("2"))["name"], "--yes")
 
     def test_name_does_not_change_the_fingerprint(self):
         self.assertEqual(il.fingerprint(snap("a", name="x")), il.fingerprint(snap("b")))
